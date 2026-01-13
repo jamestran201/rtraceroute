@@ -12,5 +12,5 @@ struct Args {
 
 fn main() {
     let args = Args::parse();
-    Traceroute{host: args.host};
+    let _ = Traceroute{host: args.host}.run();
 }
