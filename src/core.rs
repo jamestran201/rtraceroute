@@ -1,5 +1,5 @@
 use socket2::{Socket, Domain, Protocol, Type};
-use std::{net::{IpAddr, Ipv4Addr, ToSocketAddrs, UdpSocket}, time::Duration};
+use std::{net::{IpAddr, Ipv4Addr, ToSocketAddrs, UdpSocket}, time::{Duration, Instant}};
 use std::mem::MaybeUninit;
 
 // Let OS automatically assign a port
@@ -11,6 +11,11 @@ const MINIMUM_ICMP_REPLY_PACKET_LEN: usize = 20;
 struct ParsedIcmp {
     ip_addr: Ipv4Addr,
     response_code: u8
+}
+
+struct AttemptResult {
+    ip_addr: Option<Ipv4Addr>,
+    latency: u128,
 }
 
 pub(crate) struct Traceroute {
@@ -28,30 +33,63 @@ impl Traceroute {
 
         // Send packet repeatedly max 64 hops
         let dst: String = format!("{}:{}", &ip_addr, &DST_PORT);
-        let mut ttl: u32 = 1;
+        let mut ttl: u32 = 0;
         let mut dst_reached: bool = false;
         while ttl <= DEFAULT_MAX_HOPS && !dst_reached {
-            // Send probe packet
+            ttl += 1;
             let _ = send_socket.set_ttl(ttl);
-            send_socket.send_to(b"0", &dst)?;
+            let mut attempt_results: Vec<AttemptResult> = Vec::<AttemptResult>::new();
 
-            // Read ICMP reply
-            let parsed_icmp: ParsedIcmp = self.parse_icmp_reply(&rcv_socket)?;
-            println!("{} {}", ttl, parsed_icmp.ip_addr);
+            for _ in 0..3 {
+                let start_time: Instant = Instant::now();
+                send_socket.send_to(b"0", &dst)?;
 
-            match parsed_icmp.response_code {
-                11 => {
-                    ttl += 1;
+                let icmp_result: Result<ParsedIcmp, std::io::Error> = self.parse_icmp_reply(&rcv_socket);
+                let end_time: Instant = Instant::now();
+                let mut last_ip_addr: Option<Ipv4Addr> = None;
+
+                match icmp_result {
+                    Ok(parsed_icmp) => {
+                        if parsed_icmp.response_code == 3 {
+                            dst_reached = true;
+                        }
+
+                        last_ip_addr = Some(parsed_icmp.ip_addr);
+                    },
+                    Err(e) => {
+                        println!("Error: {}", e);
+                    }
                 }
-                3 => {
-                    println!("Reached destination, stopping");
-                    dst_reached = true;
-                },
-                _ => {
-                    println!("Response code: {}", parsed_icmp.response_code);
-                    ttl += 1;
-                },
+
+                let latency: u128 = (end_time - start_time).as_millis();
+                let attempt_result: AttemptResult = AttemptResult { ip_addr: last_ip_addr,  latency: latency };
+                attempt_results.push(attempt_result);
             }
+
+            let first_ip = &attempt_results[0].ip_addr;
+            let all_same_ip = attempt_results.iter().all(|attempt_result| &attempt_result.ip_addr == first_ip);
+
+            let mut message_string: String = format!("{} ", ttl);
+            if all_same_ip {
+                match first_ip {
+                    Some(ip) => message_string.push_str(&ip.to_string()),
+                    None => message_string.push('*')
+                }
+
+                message_string.push_str(&format!(" {}ms {}ms {}ms\n", &attempt_results[0].latency, &attempt_results[1].latency, &attempt_results[2].latency))
+            } else {
+                for i in 0..attempt_results.len() {
+                    let attempt_result = &attempt_results[i];
+                    match attempt_result.ip_addr {
+                        Some(ip) => message_string.push_str(&ip.to_string()),
+                        None => message_string.push('*')
+                    }
+
+                    message_string.push_str(&format!(" {}ms\n", &attempt_result.latency));
+                }
+            }
+
+            println!("{}", message_string);
         }
 
         Ok(())
