@@ -27,7 +27,7 @@ struct ProbeDstResult {
 }
 
 pub(crate) struct Traceroute {
-    pub host: String,
+    host: String,
     send_socket: UdpSocket,
     rcv_socket: Socket,
 }
@@ -45,7 +45,6 @@ impl Traceroute {
         let ip_addr: IpAddr = self.resolve_ip_addr()?;
         println!("traceroute to {} ({}), {} hops max, 40 bytes packets", &self.host, ip_addr, DEFAULT_MAX_HOPS);
 
-        // Send packet repeatedly max 64 hops
         let dst: String = format!("{}:{}", &ip_addr, &DST_PORT);
         let mut ttl: u32 = 0;
         let mut dst_reached: bool = false;
@@ -53,38 +52,11 @@ impl Traceroute {
             ttl += 1;
             let _ = self.send_socket.set_ttl(ttl);
 
-            let probe_dst_result = self.probe_dst(&dst)?;
+            let probe_dst_result: ProbeDstResult = self.probe_dst(&dst)?;
             dst_reached = probe_dst_result.dst_reached;
             let probe_results: Vec<ProbeResult> = probe_dst_result.probe_results;
 
-            let first_ip = &probe_results[0].ip_addr;
-            let all_same_ip = probe_results.iter().all(|attempt_result| &attempt_result.ip_addr == first_ip);
-
-            let mut message_string: String = format!("{:<2} ", ttl);
-            if all_same_ip {
-                match first_ip {
-                    Some(ip) => message_string.push_str(&format!("{:<16}", &ip.to_string())),
-                    None => message_string.push('*')
-                }
-
-                message_string.push_str(&format!(" {:.3}ms {:.3}ms {:.3}ms\n", &probe_results[0].latency, &probe_results[1].latency, &probe_results[2].latency))
-            } else {
-                for i in 0..probe_results.len() {
-                    if i > 0 {
-                        message_string.push_str(&format!("{:<3}", ""));
-                    }
-
-                    let attempt_result = &probe_results[i];
-                    match attempt_result.ip_addr {
-                        Some(ip) => message_string.push_str(&format!("{:<16}", &ip.to_string())),
-                        None => message_string.push_str(&format!("{:<16}", '*'))
-                    }
-
-                    message_string.push_str(&format!(" {:.3}ms\n", &attempt_result.latency));
-                }
-            }
-
-            print!("{}", message_string);
+            self.print_results(&ttl, &probe_results);
         }
 
         Ok(())
@@ -171,5 +143,40 @@ impl Traceroute {
             },
             Err(e) => return Err(e),
         }
+    }
+
+    fn print_results(&self, ttl: &u32, probe_results: &Vec<ProbeResult>) {
+        let first_ip: &Option<Ipv4Addr> = &probe_results[0].ip_addr;
+        let all_same_ip: bool = probe_results.iter().all(|attempt_result: &ProbeResult| &attempt_result.ip_addr == first_ip);
+
+        let mut message_string: String = format!("{:<2} ", ttl);
+        if all_same_ip {
+            match first_ip {
+                Some(ip) => self.format_ip_addr(&mut message_string, &ip.to_string()),
+                None => self.format_ip_addr(&mut message_string, "*")
+            }
+
+            message_string.push_str(&format!(" {:.3}ms {:.3}ms {:.3}ms\n", &probe_results[0].latency, &probe_results[1].latency, &probe_results[2].latency))
+        } else {
+            for i in 0..probe_results.len() {
+                if i > 0 {
+                    message_string.push_str(&format!("{:<3}", ""));
+                }
+
+                let probe_result: &ProbeResult = &probe_results[i];
+                match probe_result.ip_addr {
+                    Some(ip) => self.format_ip_addr(&mut message_string, &ip.to_string()),
+                    None => self.format_ip_addr(&mut message_string, "*")
+                }
+
+                message_string.push_str(&format!(" {:.3}ms\n", &probe_result.latency));
+            }
+        }
+
+        print!("{}", message_string);
+    }
+
+    fn format_ip_addr(&self, message_builder: &mut String, ip_addr: &str) {
+        message_builder.push_str(&format!("{:<16}", ip_addr))
     }
 }
