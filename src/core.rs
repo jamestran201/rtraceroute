@@ -1,4 +1,5 @@
 use socket2::{Socket, Domain, Protocol, Type};
+use std::io::Result;
 use std::{net::{IpAddr, Ipv4Addr, ToSocketAddrs, UdpSocket}, time::{Duration, Instant}};
 use std::mem::MaybeUninit;
 
@@ -7,6 +8,8 @@ const LOCAL_ADDR: &str = "0.0.0.0:0";
 const DEFAULT_MAX_HOPS: u32 = 64;
 const DST_PORT: u16 = 33434;
 const MINIMUM_ICMP_REPLY_PACKET_LEN: usize = 20;
+const RECEIVE_SOCKET_TIMEOUT: u64 = 3;
+const ZERO_40: [u8; 40] = [0; 40];
 
 struct ParsedIcmp {
     ip_addr: Ipv4Addr,
@@ -15,21 +18,27 @@ struct ParsedIcmp {
 
 struct AttemptResult {
     ip_addr: Option<Ipv4Addr>,
-    latency: u128,
+    latency: f64,
 }
 
 pub(crate) struct Traceroute {
-    pub host: String
+    pub host: String,
+    send_socket: UdpSocket,
+    rcv_socket: Socket,
+}
+
+pub fn make_traceroute(host: String) -> Result<Traceroute> {
+    let send_socket: UdpSocket = UdpSocket::bind(String::from(LOCAL_ADDR))?;
+    let rcv_socket: Socket = Socket::new(Domain::IPV4, Type::RAW, Some(Protocol::ICMPV4))?;
+    rcv_socket.set_read_timeout(Some(Duration::from_secs(RECEIVE_SOCKET_TIMEOUT)))?;
+
+    return Ok(Traceroute{host: host, send_socket: send_socket, rcv_socket: rcv_socket});
 }
 
 impl Traceroute {
     pub fn run(&self) -> std::io::Result<()> {
         let ip_addr: IpAddr = self.resolve_ip_addr()?;
-        println!("traceroute to {} ({}), {} hops max, 40 bytes packets", &self.host, DEFAULT_MAX_HOPS, ip_addr);
-
-        let send_socket: UdpSocket = UdpSocket::bind(String::from(LOCAL_ADDR))?;
-        let rcv_socket: Socket = Socket::new(Domain::IPV4, Type::RAW, Some(Protocol::ICMPV4))?;
-        rcv_socket.set_read_timeout(Some(Duration::from_secs(3)))?;
+        println!("traceroute to {} ({}), {} hops max, 40 bytes packets", &self.host, ip_addr, DEFAULT_MAX_HOPS);
 
         // Send packet repeatedly max 64 hops
         let dst: String = format!("{}:{}", &ip_addr, &DST_PORT);
@@ -37,15 +46,15 @@ impl Traceroute {
         let mut dst_reached: bool = false;
         while ttl <= DEFAULT_MAX_HOPS && !dst_reached {
             ttl += 1;
-            let _ = send_socket.set_ttl(ttl);
+            let _ = self.send_socket.set_ttl(ttl);
             let mut attempt_results: Vec<AttemptResult> = Vec::<AttemptResult>::new();
 
             for _ in 0..3 {
                 let start_time: Instant = Instant::now();
-                send_socket.send_to(b"0", &dst)?;
+                self.send_socket.send_to(&ZERO_40, &dst)?;
 
-                let icmp_result: Result<ParsedIcmp, std::io::Error> = self.parse_icmp_reply(&rcv_socket);
-                let end_time: Instant = Instant::now();
+                let icmp_result: Result<ParsedIcmp> = self.parse_icmp_reply();
+                let latency: f64 = start_time.elapsed().as_secs_f64() * 1000.0;
                 let mut last_ip_addr: Option<Ipv4Addr> = None;
 
                 match icmp_result {
@@ -56,12 +65,9 @@ impl Traceroute {
 
                         last_ip_addr = Some(parsed_icmp.ip_addr);
                     },
-                    Err(e) => {
-                        println!("Error: {}", e);
-                    }
+                    Err(_) => ()
                 }
 
-                let latency: u128 = (end_time - start_time).as_millis();
                 let attempt_result: AttemptResult = AttemptResult { ip_addr: last_ip_addr,  latency: latency };
                 attempt_results.push(attempt_result);
             }
@@ -69,27 +75,31 @@ impl Traceroute {
             let first_ip = &attempt_results[0].ip_addr;
             let all_same_ip = attempt_results.iter().all(|attempt_result| &attempt_result.ip_addr == first_ip);
 
-            let mut message_string: String = format!("{} ", ttl);
+            let mut message_string: String = format!("{:<2} ", ttl);
             if all_same_ip {
                 match first_ip {
-                    Some(ip) => message_string.push_str(&ip.to_string()),
+                    Some(ip) => message_string.push_str(&format!("{:<16}", &ip.to_string())),
                     None => message_string.push('*')
                 }
 
-                message_string.push_str(&format!(" {}ms {}ms {}ms\n", &attempt_results[0].latency, &attempt_results[1].latency, &attempt_results[2].latency))
+                message_string.push_str(&format!(" {:.3}ms {:.3}ms {:.3}ms\n", &attempt_results[0].latency, &attempt_results[1].latency, &attempt_results[2].latency))
             } else {
                 for i in 0..attempt_results.len() {
-                    let attempt_result = &attempt_results[i];
-                    match attempt_result.ip_addr {
-                        Some(ip) => message_string.push_str(&ip.to_string()),
-                        None => message_string.push('*')
+                    if i > 0 {
+                        message_string.push_str(&format!("{:<3}", ""));
                     }
 
-                    message_string.push_str(&format!(" {}ms\n", &attempt_result.latency));
+                    let attempt_result = &attempt_results[i];
+                    match attempt_result.ip_addr {
+                        Some(ip) => message_string.push_str(&format!("{:<16}", &ip.to_string())),
+                        None => message_string.push_str(&format!("{:<16}", '*'))
+                    }
+
+                    message_string.push_str(&format!(" {:.3}ms\n", &attempt_result.latency));
                 }
             }
 
-            println!("{}", message_string);
+            print!("{}", message_string);
         }
 
         Ok(())
@@ -110,9 +120,9 @@ impl Traceroute {
         Ok(chosen_ip)
     }
 
-    fn parse_icmp_reply(&self, rcv_socket: &Socket) -> std::io::Result<ParsedIcmp> {
+    fn parse_icmp_reply(&self) -> Result<ParsedIcmp> {
         let mut buf:[MaybeUninit<u8>; 2048] = [MaybeUninit::<u8>::uninit(); 2048];
-        match rcv_socket.recv(&mut buf) {
+        match self.rcv_socket.recv(&mut buf) {
             Ok(pkt_len) => {
                 if pkt_len < MINIMUM_ICMP_REPLY_PACKET_LEN {
                     return Err(std::io::Error::new(std::io::ErrorKind::Other, "ICMP reply packet length too short"));
@@ -132,8 +142,10 @@ impl Traceroute {
                     return Err(std::io::Error::new(std::io::ErrorKind::Other, "Incomplete ICMP reply"));
                 }
 
-                let icmp_start: usize = ip_header_len;
-                let icmp_type: u8 = inited_buf[icmp_start];
+                // Get the first byte of the ICMP header which contains the response type.
+                // The response packet roughly looks like: <IP HEADER>|<ICMP_HEADER>.
+                // So index at ip_header_len to skip through the IP header.
+                let icmp_type: u8 = inited_buf[ip_header_len];
 
                 // Extract source IP (the hop/router that sent this ICMP)
                 // From IP header: source address is bytes 12-15
@@ -141,7 +153,7 @@ impl Traceroute {
                     inited_buf[12], inited_buf[13], inited_buf[14], inited_buf[15]
                 );
 
-                return std::io::Result::Ok(ParsedIcmp { ip_addr: src_ip, response_code: icmp_type });
+                return Ok(ParsedIcmp { ip_addr: src_ip, response_code: icmp_type });
             },
             Err(e) => return Err(e),
         }
