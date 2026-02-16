@@ -37,7 +37,7 @@ pub fn make_traceroute(host: String) -> Result<Traceroute> {
     let rcv_socket: Socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::ICMPV4))?;
     rcv_socket.set_read_timeout(Some(Duration::from_secs(RECEIVE_SOCKET_TIMEOUT)))?;
 
-    return Ok(Traceroute{host: host, send_socket: send_socket, rcv_socket: rcv_socket});
+    return Ok(Traceroute{ host, send_socket, rcv_socket });
 }
 
 impl Traceroute {
@@ -46,17 +46,17 @@ impl Traceroute {
         println!("traceroute to {} ({}), {} hops max, 40 bytes packets", &self.host, ip_addr, DEFAULT_MAX_HOPS);
 
         let dst: String = format!("{}:{}", &ip_addr, &DST_PORT);
-        let mut ttl: u32 = 0;
-        let mut dst_reached: bool = false;
-        while ttl <= DEFAULT_MAX_HOPS && !dst_reached {
-            ttl += 1;
+        for ttl in 1..=DEFAULT_MAX_HOPS {
             let _ = self.send_socket.set_ttl(ttl);
 
             let probe_dst_result: ProbeDstResult = self.probe_dst(&dst)?;
-            dst_reached = probe_dst_result.dst_reached;
             let probe_results: Vec<ProbeResult> = probe_dst_result.probe_results;
 
             self.print_results(&ttl, &probe_results);
+
+            if probe_dst_result.dst_reached {
+                break;
+            }
         }
 
         Ok(())
@@ -77,7 +77,7 @@ impl Traceroute {
         Ok(chosen_ip)
     }
 
-    fn probe_dst(&self, dst: &String) -> Result<ProbeDstResult> {
+    fn probe_dst(&self, dst: &str) -> Result<ProbeDstResult> {
         let mut dst_reached: bool = false;
         let mut probe_results: Vec<ProbeResult> = Vec::<ProbeResult>::with_capacity(3);
         for _ in 0..3 {
@@ -99,28 +99,28 @@ impl Traceroute {
                 Err(_) => ()
             }
 
-            let attempt_result: ProbeResult = ProbeResult { ip_addr: dst_ip_addr,  latency: latency };
+            let attempt_result: ProbeResult = ProbeResult { ip_addr: dst_ip_addr,  latency };
             probe_results.push(attempt_result);
         }
 
-        Ok(ProbeDstResult { probe_results: probe_results, dst_reached: dst_reached })
+        Ok(ProbeDstResult { probe_results, dst_reached })
     }
 
     fn parse_icmp_reply(&self) -> Result<ParsedIcmp> {
-        let mut buf:[MaybeUninit<u8>; 2048] = [MaybeUninit::<u8>::uninit(); 2048];
-        match self.rcv_socket.recv(&mut buf) {
+        let mut buf = vec![0u8; 2048];
+        match self.rcv_socket.recv(unsafe {
+            std::slice::from_raw_parts_mut(buf.as_mut_ptr() as *mut MaybeUninit<u8>, buf.len())
+        }) {
             Ok(pkt_len) => {
                 if pkt_len < MINIMUM_ICMP_REPLY_PACKET_LEN {
                     return Err(std::io::Error::new(std::io::ErrorKind::Other, "ICMP reply packet length too short"));
                 }
 
-                let inited_buf: [u8; 2048] = unsafe { std::mem::transmute(buf) };
-
                 // Parse IP header length
                 // The first byte of the IP header contains the version and length.
                 // The bitwise & 0x0F masks the version and keeps the length.
                 // Multiply by 4 cause each unit of length represents 4 bytes.
-                let ip_header: u8 = inited_buf[0];
+                let ip_header: u8 = buf[0];
                 let ip_header_len: usize = (ip_header & 0x0F) as usize * 4;
 
                 // Checks for incomplete packets -- ICMP headers have at least 8 bytes
@@ -131,12 +131,12 @@ impl Traceroute {
                 // Get the first byte of the ICMP header which contains the response type.
                 // The response packet roughly looks like: <IP HEADER>|<ICMP_HEADER>.
                 // So index at ip_header_len to skip through the IP header.
-                let icmp_type: u8 = inited_buf[ip_header_len];
+                let icmp_type: u8 = buf[ip_header_len];
 
                 // Extract source IP (the hop/router that sent this ICMP)
                 // From IP header: source address is bytes 12-15
                 let src_ip: Ipv4Addr = Ipv4Addr::new(
-                    inited_buf[12], inited_buf[13], inited_buf[14], inited_buf[15]
+                    buf[12], buf[13], buf[14], buf[15]
                 );
 
                 return Ok(ParsedIcmp { ip_addr: src_ip, response_code: icmp_type });
