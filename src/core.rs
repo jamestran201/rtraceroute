@@ -34,7 +34,7 @@ pub(crate) struct Traceroute {
 
 pub fn make_traceroute(host: String) -> Result<Traceroute> {
     let send_socket: UdpSocket = UdpSocket::bind(String::from(LOCAL_ADDR))?;
-    let rcv_socket: Socket = Socket::new(Domain::IPV4, Type::RAW, Some(Protocol::ICMPV4))?;
+    let rcv_socket: Socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::ICMPV4))?;
     rcv_socket.set_read_timeout(Some(Duration::from_secs(RECEIVE_SOCKET_TIMEOUT)))?;
 
     return Ok(Traceroute{host: host, send_socket: send_socket, rcv_socket: rcv_socket});
