@@ -16,9 +16,14 @@ struct ParsedIcmp {
     response_code: u8
 }
 
-struct AttemptResult {
+struct ProbeResult {
     ip_addr: Option<Ipv4Addr>,
     latency: f64,
+}
+
+struct ProbeDstResult {
+    probe_results: Vec<ProbeResult>,
+    dst_reached: bool
 }
 
 pub(crate) struct Traceroute {
@@ -36,7 +41,7 @@ pub fn make_traceroute(host: String) -> Result<Traceroute> {
 }
 
 impl Traceroute {
-    pub fn run(&self) -> std::io::Result<()> {
+    pub fn run(&self) -> Result<()> {
         let ip_addr: IpAddr = self.resolve_ip_addr()?;
         println!("traceroute to {} ({}), {} hops max, 40 bytes packets", &self.host, ip_addr, DEFAULT_MAX_HOPS);
 
@@ -47,33 +52,13 @@ impl Traceroute {
         while ttl <= DEFAULT_MAX_HOPS && !dst_reached {
             ttl += 1;
             let _ = self.send_socket.set_ttl(ttl);
-            let mut attempt_results: Vec<AttemptResult> = Vec::<AttemptResult>::new();
 
-            for _ in 0..3 {
-                let start_time: Instant = Instant::now();
-                self.send_socket.send_to(&ZERO_40, &dst)?;
+            let probe_dst_result = self.probe_dst(&dst)?;
+            dst_reached = probe_dst_result.dst_reached;
+            let probe_results: Vec<ProbeResult> = probe_dst_result.probe_results;
 
-                let icmp_result: Result<ParsedIcmp> = self.parse_icmp_reply();
-                let latency: f64 = start_time.elapsed().as_secs_f64() * 1000.0;
-                let mut last_ip_addr: Option<Ipv4Addr> = None;
-
-                match icmp_result {
-                    Ok(parsed_icmp) => {
-                        if parsed_icmp.response_code == 3 {
-                            dst_reached = true;
-                        }
-
-                        last_ip_addr = Some(parsed_icmp.ip_addr);
-                    },
-                    Err(_) => ()
-                }
-
-                let attempt_result: AttemptResult = AttemptResult { ip_addr: last_ip_addr,  latency: latency };
-                attempt_results.push(attempt_result);
-            }
-
-            let first_ip = &attempt_results[0].ip_addr;
-            let all_same_ip = attempt_results.iter().all(|attempt_result| &attempt_result.ip_addr == first_ip);
+            let first_ip = &probe_results[0].ip_addr;
+            let all_same_ip = probe_results.iter().all(|attempt_result| &attempt_result.ip_addr == first_ip);
 
             let mut message_string: String = format!("{:<2} ", ttl);
             if all_same_ip {
@@ -82,14 +67,14 @@ impl Traceroute {
                     None => message_string.push('*')
                 }
 
-                message_string.push_str(&format!(" {:.3}ms {:.3}ms {:.3}ms\n", &attempt_results[0].latency, &attempt_results[1].latency, &attempt_results[2].latency))
+                message_string.push_str(&format!(" {:.3}ms {:.3}ms {:.3}ms\n", &probe_results[0].latency, &probe_results[1].latency, &probe_results[2].latency))
             } else {
-                for i in 0..attempt_results.len() {
+                for i in 0..probe_results.len() {
                     if i > 0 {
                         message_string.push_str(&format!("{:<3}", ""));
                     }
 
-                    let attempt_result = &attempt_results[i];
+                    let attempt_result = &probe_results[i];
                     match attempt_result.ip_addr {
                         Some(ip) => message_string.push_str(&format!("{:<16}", &ip.to_string())),
                         None => message_string.push_str(&format!("{:<16}", '*'))
@@ -118,6 +103,35 @@ impl Traceroute {
         }
 
         Ok(chosen_ip)
+    }
+
+    fn probe_dst(&self, dst: &String) -> Result<ProbeDstResult> {
+        let mut dst_reached: bool = false;
+        let mut probe_results: Vec<ProbeResult> = Vec::<ProbeResult>::with_capacity(3);
+        for _ in 0..3 {
+            let start_time: Instant = Instant::now();
+            self.send_socket.send_to(&ZERO_40, dst)?;
+
+            let icmp_result: Result<ParsedIcmp> = self.parse_icmp_reply();
+            let latency: f64 = start_time.elapsed().as_secs_f64() * 1000.0;
+            let mut dst_ip_addr: Option<Ipv4Addr> = None;
+
+            match icmp_result {
+                Ok(parsed_icmp) => {
+                    if parsed_icmp.response_code == 3 {
+                        dst_reached = true;
+                    }
+
+                    dst_ip_addr = Some(parsed_icmp.ip_addr);
+                },
+                Err(_) => ()
+            }
+
+            let attempt_result: ProbeResult = ProbeResult { ip_addr: dst_ip_addr,  latency: latency };
+            probe_results.push(attempt_result);
+        }
+
+        Ok(ProbeDstResult { probe_results: probe_results, dst_reached: dst_reached })
     }
 
     fn parse_icmp_reply(&self) -> Result<ParsedIcmp> {
